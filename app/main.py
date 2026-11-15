@@ -1,4 +1,4 @@
-"""FastAPI 入口：采样登记 / 仪器检测记录配对服务。"""
+"""FastAPI 入口：采样配对服务 + 连续批次质控偏差报警审计。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,14 @@ from datetime import datetime
 from fastapi import Body, FastAPI
 from fastapi.responses import RedirectResponse
 
+from .drift import DriftBatch, audit_drift
+from .drift_examples import DRIFT_DEMO_EXAMPLES
+from .drift_schemas import (
+    BatchAuditOut,
+    DriftAuditRequest,
+    DriftAuditResponse,
+    DriftAuditSummaryOut,
+)
 from .examples import DEMO_EXAMPLES
 from .matching import Analysis, Record, analyze
 from .schemas import (
@@ -22,17 +30,26 @@ from .schemas import (
 )
 
 app = FastAPI(
-    title="采样-检测记录配对服务",
+    title="采样配对与质控漂移审计服务",
     description=(
+        "## 1. 采样-检测记录配对 `/match`\n\n"
         "把人工采样登记与仪器检测记录按'同条码 + UTC 时间差 ≤ 10 分钟'配对，"
         "每条记录至多用一次；先最大化配对数，再最小化时间差总和。\n\n"
         "接口只把**所有同等最优方案中都成立**的配对列为确定配对（certain），"
         "其余记录区分为待核查（review）与始终未配对（unmatched），"
         "不会任选一套最优方案冒充确定结论。\n\n"
-        "右侧 `/match` 的 Examples 下拉框内置三组演示请求："
-        "重复条码、交叉候选、等价最优。"
+        "`/match` 的 Examples 下拉框内置三组演示请求："
+        "重复条码、交叉候选、等价最优。\n\n"
+        "## 2. 连续批次漂移审计 `/drift-audit`\n\n"
+        "仪器只给出每批读数的**误差闭区间**，绝不取中点代替实际读数。"
+        "对区间内所有可能整数读数逐批判定：必报警（will_alarm）、"
+        "可能报警（may_alarm）或不报警（no_alarm）。"
+        "任一侧累计达到 h 的批次会触发报警并使两侧清零，后续批次因此"
+        "保留此前读数与重置的状态关联，而非孤立地逐批重算。\n\n"
+        "`/drift-audit` 的 Examples 下拉框内置三组演示请求："
+        "正向缓漂、报警后清零、双向不确定。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -119,5 +136,59 @@ def match(
         ],
         detection_records=[
             _verdict_out(r, analysis, is_sampling=False) for r in request.detection_records
+        ],
+    )
+
+
+@app.post(
+    "/drift-audit",
+    response_model=DriftAuditResponse,
+    summary="逐批判定连续批次质控偏差的报警确定性",
+    description=(
+        "接收同一仪器从 0 连续编号的最多 24 批整数偏差闭区间（端点绝对值 ≤ 20）、"
+        "整数允差 k（0–20）与警戒值 h（1–40）。每批：\n\n"
+        "- 正向累计 `pos = max(0, pos + d - k)`；\n"
+        "- 负向累计 `neg = max(0, neg - d - k)`；\n"
+        "- 任一侧达到 h（>= h）即在该批报警，且两侧清零、下一批从零开始。\n\n"
+        "对每批区间内所有可能整数读数逐批返回 will_alarm / may_alarm / no_alarm。"
+        "后续批次基于此前所有可能读数产生的可达累计状态集合判定，"
+        "保留累计与报警重置造成的状态关联；不使用区间中点。"
+    ),
+)
+def drift_audit(
+    request: DriftAuditRequest = Body(openapi_examples=DRIFT_DEMO_EXAMPLES),
+) -> DriftAuditResponse:
+    result = audit_drift(
+        [DriftBatch(low=b.low, high=b.high) for b in request.batches],
+        k=request.k,
+        h=request.h,
+    )
+
+    counts = Counter(batch.status for batch in result.batches)
+    first_certain = next(
+        (batch.index for batch in result.batches if batch.alarm_certain), None
+    )
+
+    return DriftAuditResponse(
+        summary=DriftAuditSummaryOut(
+            batch_count=len(result.batches),
+            k=result.k,
+            h=result.h,
+            will_alarm_count=counts.get("will_alarm", 0),
+            may_alarm_count=counts.get("may_alarm", 0),
+            no_alarm_count=counts.get("no_alarm", 0),
+            first_certain_alarm_index=first_certain,
+        ),
+        batches=[
+            BatchAuditOut(
+                index=batch.index,
+                low=batch.low,
+                high=batch.high,
+                status=batch.status,
+                alarm_certain=batch.alarm_certain,
+                alarm_possible=batch.alarm_possible,
+                possible_alarm_deviations=list(batch.possible_alarm_deviations),
+            )
+            for batch in result.batches
         ],
     )
